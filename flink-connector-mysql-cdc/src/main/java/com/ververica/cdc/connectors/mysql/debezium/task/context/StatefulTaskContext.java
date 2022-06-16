@@ -18,28 +18,25 @@
 
 package com.ververica.cdc.connectors.mysql.debezium.task.context;
 
-import org.apache.flink.configuration.Configuration;
-
 import com.github.shyiko.mysql.binlog.BinaryLogClient;
+import com.ververica.cdc.connectors.mysql.debezium.DebeziumUtils;
 import com.ververica.cdc.connectors.mysql.debezium.EmbeddedFlinkDatabaseHistory;
 import com.ververica.cdc.connectors.mysql.debezium.dispatcher.EventDispatcherImpl;
-import com.ververica.cdc.connectors.mysql.source.MySqlSourceOptions;
+import com.ververica.cdc.connectors.mysql.debezium.dispatcher.SignalEventDispatcher;
+import com.ververica.cdc.connectors.mysql.source.config.MySqlSourceConfig;
 import com.ververica.cdc.connectors.mysql.source.offset.BinlogOffset;
 import com.ververica.cdc.connectors.mysql.source.split.MySqlSplit;
 import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.connector.base.ChangeEventQueue;
+import io.debezium.connector.mysql.GtidSet;
 import io.debezium.connector.mysql.MySqlChangeEventSourceMetricsFactory;
 import io.debezium.connector.mysql.MySqlConnection;
 import io.debezium.connector.mysql.MySqlConnectorConfig;
 import io.debezium.connector.mysql.MySqlDatabaseSchema;
-import io.debezium.connector.mysql.MySqlErrorHandler;
 import io.debezium.connector.mysql.MySqlOffsetContext;
 import io.debezium.connector.mysql.MySqlStreamingChangeEventSourceMetrics;
 import io.debezium.connector.mysql.MySqlTopicSelector;
-import io.debezium.connector.mysql.MySqlValueConverters;
 import io.debezium.data.Envelope;
-import io.debezium.jdbc.JdbcValueConverters;
-import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.pipeline.DataChangeEvent;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.metrics.SnapshotChangeEventSourceMetrics;
@@ -47,7 +44,6 @@ import io.debezium.pipeline.metrics.StreamingChangeEventSourceMetrics;
 import io.debezium.pipeline.source.spi.EventMetadataProvider;
 import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.relational.TableId;
-import io.debezium.relational.history.AbstractDatabaseHistory;
 import io.debezium.schema.DataCollectionId;
 import io.debezium.schema.TopicSelector;
 import io.debezium.util.Clock;
@@ -58,15 +54,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
-import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
-import static io.debezium.config.CommonConnectorConfig.TOMBSTONES_ON_DELETE;
+import static com.ververica.cdc.connectors.mysql.source.offset.BinlogOffset.BINLOG_FILENAME_OFFSET_KEY;
 
 /**
  * A stateful task context that contains entries the debezium mysql connector task required.
  *
- * <p>The offset change and schema change should record to MySQLSplitState when emit the record,
+ * <p>The offset change and schema change should record to MySqlSplitState when emit the record,
  * thus the Flink's state mechanism can help to store/restore when failover happens.
  */
 public class StatefulTaskContext {
@@ -74,12 +70,12 @@ public class StatefulTaskContext {
     private static final Logger LOG = LoggerFactory.getLogger(StatefulTaskContext.class);
     private static final Clock clock = Clock.SYSTEM;
 
-    private final io.debezium.config.Configuration dezConf;
+    private final MySqlSourceConfig sourceConfig;
     private final MySqlConnectorConfig connectorConfig;
     private final MySqlEventMetadataProvider metadataProvider;
     private final SchemaNameAdjuster schemaNameAdjuster;
-    private MySqlConnection connection;
-    private BinaryLogClient binaryLogClient;
+    private final MySqlConnection connection;
+    private final BinaryLogClient binaryLogClient;
 
     private MySqlDatabaseSchema databaseSchema;
     private MySqlTaskContextImpl taskContext;
@@ -88,15 +84,16 @@ public class StatefulTaskContext {
     private SnapshotChangeEventSourceMetrics snapshotChangeEventSourceMetrics;
     private StreamingChangeEventSourceMetrics streamingChangeEventSourceMetrics;
     private EventDispatcherImpl<TableId> dispatcher;
+    private SignalEventDispatcher signalEventDispatcher;
     private ChangeEventQueue<DataChangeEvent> queue;
     private ErrorHandler errorHandler;
 
     public StatefulTaskContext(
-            Configuration configuration,
+            MySqlSourceConfig sourceConfig,
             BinaryLogClient binaryLogClient,
             MySqlConnection connection) {
-        this.dezConf = toDebeziumConfig(configuration);
-        this.connectorConfig = new MySqlConnectorConfig(dezConf);
+        this.sourceConfig = sourceConfig;
+        this.connectorConfig = sourceConfig.getMySqlConnectorConfig();
         this.schemaNameAdjuster = SchemaNameAdjuster.create();
         this.metadataProvider = new MySqlEventMetadataProvider();
         this.binaryLogClient = binaryLogClient;
@@ -107,25 +104,20 @@ public class StatefulTaskContext {
         // initial stateful objects
         final boolean tableIdCaseInsensitive = connection.isTableIdCaseSensitive();
         this.topicSelector = MySqlTopicSelector.defaultSelector(connectorConfig);
-        final MySqlValueConverters valueConverters = getValueConverters(connectorConfig);
         EmbeddedFlinkDatabaseHistory.registerHistory(
-                dezConf.getString(EmbeddedFlinkDatabaseHistory.DATABASE_HISTORY_INSTANCE_NAME),
+                sourceConfig
+                        .getDbzConfiguration()
+                        .getString(EmbeddedFlinkDatabaseHistory.DATABASE_HISTORY_INSTANCE_NAME),
                 mySqlSplit.getTableSchemas().values());
         this.databaseSchema =
-                new MySqlDatabaseSchema(
-                        connectorConfig,
-                        valueConverters,
-                        topicSelector,
-                        schemaNameAdjuster,
-                        tableIdCaseInsensitive);
+                DebeziumUtils.createMySqlDatabaseSchema(connectorConfig, tableIdCaseInsensitive);
         this.offsetContext =
-                (MySqlOffsetContext)
-                        loadStartingOffsetState(
-                                new MySqlOffsetContext.Loader(connectorConfig), mySqlSplit);
+                loadStartingOffsetState(new MySqlOffsetContext.Loader(connectorConfig), mySqlSplit);
         validateAndLoadDatabaseHistory(offsetContext, databaseSchema);
 
         this.taskContext =
                 new MySqlTaskContextImpl(connectorConfig, databaseSchema, binaryLogClient);
+
         final int queueSize =
                 mySqlSplit.isSnapshotSplit()
                         ? Integer.MAX_VALUE
@@ -140,7 +132,7 @@ public class StatefulTaskContext {
                                 () ->
                                         taskContext.configureLoggingContext(
                                                 "mysql-cdc-connector-task"))
-                        // no buffer any more, we use signal event
+                        // do not buffer any element, we use signal event
                         // .buffering()
                         .build();
         this.dispatcher =
@@ -154,6 +146,10 @@ public class StatefulTaskContext {
                         metadataProvider,
                         schemaNameAdjuster);
 
+        this.signalEventDispatcher =
+                new SignalEventDispatcher(
+                        offsetContext.getPartition(), topicSelector.getPrimaryTopic(), queue);
+
         final MySqlChangeEventSourceMetricsFactory changeEventSourceMetricsFactory =
                 new MySqlChangeEventSourceMetricsFactory(
                         new MySqlStreamingChangeEventSourceMetrics(
@@ -164,7 +160,8 @@ public class StatefulTaskContext {
         this.streamingChangeEventSourceMetrics =
                 changeEventSourceMetricsFactory.getStreamingMetrics(
                         taskContext, queue, metadataProvider);
-        this.errorHandler = new MySqlErrorHandler(connectorConfig.getLogicalName(), queue);
+        this.errorHandler =
+                new MySqlErrorHandler(connectorConfig.getLogicalName(), queue, taskContext);
     }
 
     private void validateAndLoadDatabaseHistory(
@@ -174,46 +171,102 @@ public class StatefulTaskContext {
     }
 
     /** Loads the connector's persistent offset (if present) via the given loader. */
-    private OffsetContext loadStartingOffsetState(
+    private MySqlOffsetContext loadStartingOffsetState(
             OffsetContext.Loader loader, MySqlSplit mySqlSplit) {
-        Map<String, Object> previousOffset = new HashMap<>();
         BinlogOffset offset =
                 mySqlSplit.isSnapshotSplit()
                         ? BinlogOffset.INITIAL_OFFSET
                         : mySqlSplit.asBinlogSplit().getStartingOffset();
-        previousOffset.put("file", offset.getFilename());
-        previousOffset.put("pos", offset.getPosition());
 
-        if (previousOffset != null) {
-            OffsetContext offsetContext = loader.load(previousOffset);
-            return offsetContext;
-        } else {
-            return null;
+        MySqlOffsetContext mySqlOffsetContext =
+                (MySqlOffsetContext) loader.load(offset.getOffset());
+
+        if (!isBinlogAvailable(mySqlOffsetContext)) {
+            throw new IllegalStateException(
+                    "The connector is trying to read binlog starting at "
+                            + mySqlOffsetContext.getSourceInfo()
+                            + ", but this is no longer "
+                            + "available on the server. Reconfigure the connector to use a snapshot when needed.");
         }
+        return mySqlOffsetContext;
     }
 
-    private static MySqlValueConverters getValueConverters(MySqlConnectorConfig configuration) {
-        TemporalPrecisionMode timePrecisionMode = configuration.getTemporalPrecisionMode();
-        JdbcValueConverters.DecimalMode decimalMode = configuration.getDecimalMode();
-        String bigIntUnsignedHandlingModeStr =
-                configuration
-                        .getConfig()
-                        .getString(MySqlConnectorConfig.BIGINT_UNSIGNED_HANDLING_MODE);
-        MySqlConnectorConfig.BigIntUnsignedHandlingMode bigIntUnsignedHandlingMode =
-                MySqlConnectorConfig.BigIntUnsignedHandlingMode.parse(
-                        bigIntUnsignedHandlingModeStr);
-        JdbcValueConverters.BigIntUnsignedMode bigIntUnsignedMode =
-                bigIntUnsignedHandlingMode.asBigIntUnsignedMode();
+    private boolean isBinlogAvailable(MySqlOffsetContext offset) {
+        String gtidStr = offset.gtidSet();
+        if (gtidStr != null) {
+            return checkGtidSet(offset);
+        }
 
-        final boolean timeAdjusterEnabled =
-                configuration.getConfig().getBoolean(MySqlConnectorConfig.ENABLE_TIME_ADJUSTER);
-        return new MySqlValueConverters(
-                decimalMode,
-                timePrecisionMode,
-                bigIntUnsignedMode,
-                configuration.binaryHandlingMode(),
-                timeAdjusterEnabled ? MySqlValueConverters::adjustTemporal : x -> x,
-                MySqlValueConverters::defaultParsingErrorHandler);
+        return checkBinlogFilename(offset);
+    }
+
+    private boolean checkGtidSet(MySqlOffsetContext offset) {
+        String gtidStr = offset.gtidSet();
+
+        if (gtidStr.trim().isEmpty()) {
+            return true; // start at beginning ...
+        }
+
+        String availableGtidStr = connection.knownGtidSet();
+        if (availableGtidStr == null || availableGtidStr.trim().isEmpty()) {
+            // Last offsets had GTIDs but the server does not use them ...
+            LOG.warn(
+                    "Connector used GTIDs previously, but MySQL does not know of any GTIDs or they are not enabled");
+            return false;
+        }
+        // GTIDs are enabled
+        GtidSet gtidSet = new GtidSet(gtidStr);
+        // Get the GTID set that is available in the server ...
+        GtidSet availableGtidSet = new GtidSet(availableGtidStr);
+        if (gtidSet.isContainedWithin(availableGtidSet)) {
+            LOG.info(
+                    "MySQL current GTID set {} does contain the GTID set {} required by the connector.",
+                    availableGtidSet,
+                    gtidSet);
+            // The replication is concept of mysql master-slave replication protocol ...
+            final GtidSet gtidSetToReplicate =
+                    connection.subtractGtidSet(availableGtidSet, gtidSet);
+            final GtidSet purgedGtidSet = connection.purgedGtidSet();
+            LOG.info("Server has already purged {} GTIDs", purgedGtidSet);
+            final GtidSet nonPurgedGtidSetToReplicate =
+                    connection.subtractGtidSet(gtidSetToReplicate, purgedGtidSet);
+            LOG.info(
+                    "GTID set {} known by the server but not processed yet, for replication are available only GTID set {}",
+                    gtidSetToReplicate,
+                    nonPurgedGtidSetToReplicate);
+            if (!gtidSetToReplicate.equals(nonPurgedGtidSetToReplicate)) {
+                LOG.warn("Some of the GTIDs needed to replicate have been already purged");
+                return false;
+            }
+            return true;
+        }
+        LOG.info("Connector last known GTIDs are {}, but MySQL has {}", gtidSet, availableGtidSet);
+        return false;
+    }
+
+    private boolean checkBinlogFilename(MySqlOffsetContext offset) {
+        String binlogFilename = offset.getSourceInfo().getString(BINLOG_FILENAME_OFFSET_KEY);
+        if (binlogFilename == null) {
+            return true; // start at current position
+        }
+        if (binlogFilename.equals("")) {
+            return true; // start at beginning
+        }
+
+        // Accumulate the available binlog filenames ...
+        List<String> logNames = connection.availableBinlogFiles();
+
+        // And compare with the one we're supposed to use ...
+        boolean found = logNames.stream().anyMatch(binlogFilename::equals);
+        if (!found) {
+            LOG.info(
+                    "Connector requires binlog file '{}', but MySQL only has {}",
+                    binlogFilename,
+                    String.join(", ", logNames));
+        } else {
+            LOG.info("MySQL has the binlog file '{}' required by the connector", binlogFilename);
+        }
+        return found;
     }
 
     /** Copied from debezium for accessing here. */
@@ -271,8 +324,8 @@ public class StatefulTaskContext {
         return clock;
     }
 
-    public io.debezium.config.Configuration getDezConf() {
-        return dezConf;
+    public MySqlSourceConfig getSourceConfig() {
+        return sourceConfig;
     }
 
     public MySqlConnectorConfig getConnectorConfig() {
@@ -297,6 +350,10 @@ public class StatefulTaskContext {
 
     public EventDispatcherImpl<TableId> getDispatcher() {
         return dispatcher;
+    }
+
+    public SignalEventDispatcher getSignalEventDispatcher() {
+        return signalEventDispatcher;
     }
 
     public ChangeEventQueue<DataChangeEvent> getQueue() {
@@ -327,49 +384,5 @@ public class StatefulTaskContext {
 
     public SchemaNameAdjuster getSchemaNameAdjuster() {
         return schemaNameAdjuster;
-    }
-
-    // ------------ utils ---------
-    public static BinaryLogClient getBinaryClient(Configuration configuration) {
-        final MySqlConnectorConfig connectorConfig =
-                new MySqlConnectorConfig(toDebeziumConfig(configuration));
-        return new BinaryLogClient(
-                connectorConfig.hostname(),
-                connectorConfig.port(),
-                connectorConfig.username(),
-                connectorConfig.password());
-    }
-
-    public static MySqlConnection getConnection(Configuration configuration) {
-        return new MySqlConnection(
-                new MySqlConnection.MySqlConnectionConfiguration(toDebeziumConfig(configuration)));
-    }
-
-    public static MySqlDatabaseSchema getMySqlDatabaseSchema(
-            Configuration configuration, MySqlConnection connection) {
-        io.debezium.config.Configuration dezConf = toDebeziumConfig(configuration);
-        MySqlConnectorConfig connectorConfig = new MySqlConnectorConfig(dezConf);
-        boolean tableIdCaseInsensitive = connection.isTableIdCaseSensitive();
-        TopicSelector<TableId> topicSelector = MySqlTopicSelector.defaultSelector(connectorConfig);
-        SchemaNameAdjuster schemaNameAdjuster = SchemaNameAdjuster.create();
-        MySqlValueConverters valueConverters = getValueConverters(connectorConfig);
-        return new MySqlDatabaseSchema(
-                connectorConfig,
-                valueConverters,
-                topicSelector,
-                schemaNameAdjuster,
-                tableIdCaseInsensitive);
-    }
-
-    public static io.debezium.config.Configuration toDebeziumConfig(Configuration configuration) {
-        return io.debezium.config.Configuration.from(configuration.toMap())
-                .edit()
-                .with(AbstractDatabaseHistory.INTERNAL_PREFER_DDL, true)
-                .with(TOMBSTONES_ON_DELETE, false)
-                .with("database.responseBuffering", "adaptive")
-                .with(
-                        "database.fetchSize",
-                        configuration.getInteger(MySqlSourceOptions.SCAN_SNAPSHOT_FETCH_SIZE))
-                .build();
     }
 }
