@@ -1,11 +1,9 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * Copyright 2022 Ververica Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -21,7 +19,7 @@ package com.ververica.cdc.connectors.mysql.debezium.reader;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.FlinkRuntimeException;
 
-import org.apache.flink.shaded.guava18.com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.flink.shaded.guava30.com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 import com.ververica.cdc.connectors.mysql.debezium.task.MySqlBinlogSplitReadTask;
 import com.ververica.cdc.connectors.mysql.debezium.task.context.StatefulTaskContext;
@@ -45,9 +43,11 @@ import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -76,6 +76,7 @@ public class BinlogSplitReader implements DebeziumReader<SourceRecord, MySqlSpli
     private Map<TableId, List<FinishedSnapshotSplitInfo>> finishedSplitsInfo;
     // tableId -> the max splitHighWatermark
     private Map<TableId, BinlogOffset> maxSplitHighWatermarkMap;
+    private final Set<TableId> pureBinlogPhaseTables;
     private Tables.TableFilter capturedTableFilter;
 
     public BinlogSplitReader(StatefulTaskContext statefulTaskContext, int subTaskId) {
@@ -84,6 +85,7 @@ public class BinlogSplitReader implements DebeziumReader<SourceRecord, MySqlSpli
                 new ThreadFactoryBuilder().setNameFormat("debezium-reader-" + subTaskId).build();
         this.executor = Executors.newSingleThreadExecutor(threadFactory);
         this.currentTaskRunning = true;
+        this.pureBinlogPhaseTables = new HashSet<>();
     }
 
     public void submitSplit(MySqlSplit mySqlSplit) {
@@ -204,8 +206,9 @@ public class BinlogSplitReader implements DebeziumReader<SourceRecord, MySqlSpli
             // only the table who captured snapshot splits need to filter
             if (finishedSplitsInfo.containsKey(tableId)) {
                 RowType splitKeyType =
-                        ChunkUtils.getSplitType(
-                                statefulTaskContext.getDatabaseSchema().tableFor(tableId));
+                        ChunkUtils.getChunkKeyColumnType(
+                                statefulTaskContext.getDatabaseSchema().tableFor(tableId),
+                                statefulTaskContext.getSourceConfig().getChunkKeyColumn());
                 Object[] key =
                         getSplitKey(
                                 splitKeyType,
@@ -228,9 +231,13 @@ public class BinlogSplitReader implements DebeziumReader<SourceRecord, MySqlSpli
     }
 
     private boolean hasEnterPureBinlogPhase(TableId tableId, BinlogOffset position) {
+        if (pureBinlogPhaseTables.contains(tableId)) {
+            return true;
+        }
         // the existed tables those have finished snapshot reading
         if (maxSplitHighWatermarkMap.containsKey(tableId)
                 && position.isAtOrAfter(maxSplitHighWatermarkMap.get(tableId))) {
+            pureBinlogPhaseTables.add(tableId);
             return true;
         }
         // capture dynamically new added tables
@@ -271,6 +278,7 @@ public class BinlogSplitReader implements DebeziumReader<SourceRecord, MySqlSpli
         }
         this.finishedSplitsInfo = splitsInfoMap;
         this.maxSplitHighWatermarkMap = tableIdBinlogPositionMap;
+        this.pureBinlogPhaseTables.clear();
     }
 
     public void stopBinlogReadTask() {

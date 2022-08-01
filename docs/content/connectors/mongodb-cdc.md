@@ -227,6 +227,13 @@ Connector Options
       <td>The max size of the queue to use when copying data.</td>
     </tr>
     <tr>
+      <td>batch.size</td>
+      <td>optional</td>
+      <td style="word-wrap: break-word;">0</td>
+      <td>Integer</td>
+      <td>Change stream cursor batch size. Specifies the maximum number of change events to return in each batch of the response from the MongoDB cluster. The default is 0 meaning it uses the server's default value.</td>
+    </tr>
+    <tr>
       <td>poll.max.batch.size</td>
       <td>optional</td>
       <td style="word-wrap: break-word;">1000</td>
@@ -290,7 +297,7 @@ The extended CREATE TABLE example demonstrates the syntax for exposing these met
 ```sql
 CREATE TABLE products (
     db_name STRING METADATA FROM 'database_name' VIRTUAL,
-    table_name STRING METADATA  FROM 'table_name' VIRTUAL,
+    collection_name STRING METADATA  FROM 'collection_name' VIRTUAL,
     operation_ts TIMESTAMP_LTZ(3) METADATA FROM 'op_ts' VIRTUAL,
     _id STRING, // must be declared
     name STRING,
